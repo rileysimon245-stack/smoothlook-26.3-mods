@@ -1,0 +1,431 @@
+name: build
+
+on:
+  workflow_dispatch:
+  push:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate project files
+        run: |
+          mkdir -p "$(dirname 'build.gradle')"
+          cat > 'build.gradle' <<'SMOOTHEOF'
+          plugins {
+          	id 'net.fabricmc.fabric-loom' version "${loom_version}"
+          	id 'maven-publish'
+          }
+
+          version = project.mod_version
+          group = project.maven_group
+
+          base {
+          	archivesName = project.archives_base_name
+          }
+
+          dependencies {
+          	minecraft "com.mojang:minecraft:${project.minecraft_version}"
+          	implementation "net.fabricmc:fabric-loader:${project.loader_version}"
+          }
+
+          processResources {
+          	inputs.property "version", project.version
+
+          	filesMatching("fabric.mod.json") {
+          		expand "version": inputs.properties.version
+          	}
+          }
+
+          tasks.withType(JavaCompile).configureEach {
+          	it.options.encoding = "UTF-8"
+          	it.options.release = 25
+          }
+
+          java {
+          	sourceCompatibility = JavaVersion.VERSION_25
+          	targetCompatibility = JavaVersion.VERSION_25
+          }
+          SMOOTHEOF
+          mkdir -p "$(dirname 'gradle.properties')"
+          cat > 'gradle.properties' <<'SMOOTHEOF'
+          org.gradle.jvmargs=-Xmx2G
+          org.gradle.parallel=true
+          org.gradle.configuration-cache=false
+
+          # Fabric Properties (see https://fabricmc.net/develop and https://fabricmc.net/2026/09/15/263.html)
+          minecraft_version=26.3
+          loader_version=0.19.5
+          loom_version=1.17-SNAPSHOT
+
+          # Mod Properties
+          mod_version=1.1.0
+          maven_group=dev.smoothlook
+          archives_base_name=smoothlook
+          SMOOTHEOF
+          mkdir -p "$(dirname 'settings.gradle')"
+          cat > 'settings.gradle' <<'SMOOTHEOF'
+          pluginManagement {
+          	repositories {
+          		maven {
+          			name = 'Fabric'
+          			url = 'https://maven.fabricmc.net/'
+          		}
+          		mavenCentral()
+          		gradlePluginPortal()
+          	}
+          }
+
+          rootProject.name = 'smoothlook'
+          SMOOTHEOF
+          mkdir -p "$(dirname 'src/main/java/dev/smoothlook/SmoothLook.java')"
+          cat > 'src/main/java/dev/smoothlook/SmoothLook.java' <<'SMOOTHEOF'
+          package dev.smoothlook;
+
+          import com.google.gson.Gson;
+          import com.google.gson.GsonBuilder;
+          import java.io.IOException;
+          import java.io.Reader;
+          import java.lang.ref.WeakReference;
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+          import java.nio.file.attribute.FileTime;
+          import net.fabricmc.loader.api.FabricLoader;
+          import net.minecraft.client.player.LocalPlayer;
+          import org.slf4j.Logger;
+          import org.slf4j.LoggerFactory;
+
+          /**
+           * Two modes (config "mode"):
+           *  - "camera" (default): aim follows the mouse instantly, the RENDERED camera lags behind and catches up.
+           *  - "input": mouse input itself is delayed (aim == camera, both lag).
+           *
+           * Camera mode stores only a small "lag offset" (camera angle minus real angle), never absolute angles,
+           * and wraps yaw differences into -180..180, so crossing the 180/-180 border cannot glitch or drift.
+           * Everything runs on the client main thread.
+           */
+          public final class SmoothLook {
+          	private static final Logger LOGGER = LoggerFactory.getLogger("smoothlook");
+          	private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+          	private static final Path CONFIG_PATH = FabricLoader.getInstance().getConfigDir().resolve("smoothlook.json");
+
+          	private static final double MAX_TAU_SECONDS = 0.40; // time constant at lag = 100
+          	private static final double MAX_OFFSET_DEGREES = 90.0;
+          	private static final double FLUSH_EPSILON = 0.05;
+
+          	public static final class Config {
+          		public boolean enabled = true;
+          		/** "camera" = camera lags behind the aim, "input" = mouse input is delayed. */
+          		public String mode = "camera";
+          		/** 0 = off, 100 = strongest lag. */
+          		public int lag = 70;
+          	}
+
+          	private static volatile Config config = new Config();
+          	private static FileTime lastModified;
+          	private static long lastConfigCheckNs = Long.MIN_VALUE;
+          	private static boolean configErrorLogged;
+
+          	// ---- input mode state ----
+          	private static WeakReference<LocalPlayer> lastPlayer = new WeakReference<>(null);
+          	private static long lastInputNs;
+          	private static double pendingYaw;
+          	private static double pendingPitch;
+          	public static double outYaw;
+          	public static double outPitch;
+
+          	// ---- camera mode state ----
+          	private static boolean camInit;
+          	private static long lastCamNs;
+          	private static float lastTargetYaw;
+          	private static float lastTargetPitch;
+          	private static double offsetYaw;
+          	private static double offsetPitch;
+          	public static float camYaw;
+          	public static float camPitch;
+
+          	private SmoothLook() {}
+
+          	private static boolean inputMode(Config c) {
+          		return "input".equalsIgnoreCase(c.mode);
+          	}
+
+          	private static double tau(Config c) {
+          		return Math.max(0.001, (c.lag / 100.0) * MAX_TAU_SECONDS);
+          	}
+
+          	private static double wrap180(double a) {
+          		a %= 360.0;
+          		if (a >= 180.0) a -= 360.0;
+          		else if (a < -180.0) a += 360.0;
+          		return a;
+          	}
+
+          	// ================= camera mode =================
+
+          	public static void applyCamera(float yaw, float pitch) {
+          		long now = System.nanoTime();
+          		reloadConfigIfChanged(now);
+          		Config c = config;
+
+          		if (!c.enabled || c.lag <= 0 || inputMode(c)) {
+          			camInit = false;
+          			offsetYaw = 0;
+          			offsetPitch = 0;
+          			camYaw = yaw;
+          			camPitch = pitch;
+          			return;
+          		}
+
+          		if (!camInit) {
+          			camInit = true;
+          			lastTargetYaw = yaw;
+          			lastTargetPitch = pitch;
+          			offsetYaw = 0;
+          			offsetPitch = 0;
+          			lastCamNs = now;
+          		}
+
+          		double dt = Math.max(0.0, Math.min((now - lastCamNs) / 1.0e9, 0.1));
+          		lastCamNs = now;
+
+          		double dYaw = wrap180(yaw - lastTargetYaw);
+          		double dPitch = pitch - lastTargetPitch;
+          		lastTargetYaw = yaw;
+          		lastTargetPitch = pitch;
+
+          		if (Math.abs(dYaw) > 120.0 || Math.abs(dPitch) > 120.0) {
+          			// teleport / respawn / spectator switch: no lag
+          			offsetYaw = 0;
+          			offsetPitch = 0;
+          		} else {
+          			// the camera stays where it was, so the gap to the (moved) target grows by the target's movement
+          			offsetYaw -= dYaw;
+          			offsetPitch -= dPitch;
+          		}
+
+          		double decay = Math.exp(-dt / tau(c)); // frame-rate independent catch-up
+          		offsetYaw *= decay;
+          		offsetPitch *= decay;
+
+          		offsetYaw = Math.max(-MAX_OFFSET_DEGREES, Math.min(MAX_OFFSET_DEGREES, offsetYaw));
+          		offsetPitch = Math.max(-MAX_OFFSET_DEGREES, Math.min(MAX_OFFSET_DEGREES, offsetPitch));
+          		if (Math.abs(offsetYaw) < 0.001) offsetYaw = 0;
+          		if (Math.abs(offsetPitch) < 0.001) offsetPitch = 0;
+
+          		camYaw = (float) (yaw + offsetYaw);
+          		camPitch = (float) Math.max(-90.0, Math.min(90.0, pitch + offsetPitch));
+          	}
+
+          	// ================= input mode =================
+
+          	public static void prepare(LocalPlayer player, double yaw, double pitch) {
+          		long now = System.nanoTime();
+          		reloadConfigIfChanged(now);
+
+          		if (lastPlayer.get() != player) {
+          			lastPlayer = new WeakReference<>(player);
+          			pendingYaw = 0;
+          			pendingPitch = 0;
+          			lastInputNs = now;
+          		}
+
+          		double dt = Math.min((now - lastInputNs) / 1.0e9, 0.1);
+          		lastInputNs = now;
+
+          		pendingYaw += yaw;
+          		pendingPitch += pitch;
+
+          		Config c = config;
+          		if (!c.enabled || c.lag <= 0 || !inputMode(c)) {
+          			outYaw = pendingYaw;
+          			outPitch = pendingPitch;
+          			pendingYaw = 0;
+          			pendingPitch = 0;
+          			return;
+          		}
+
+          		double alpha = 1.0 - Math.exp(-dt / tau(c));
+          		double applyYaw = pendingYaw * alpha;
+          		double applyPitch = pendingPitch * alpha;
+          		pendingYaw -= applyYaw;
+          		pendingPitch -= applyPitch;
+
+          		if (Math.abs(pendingYaw) < FLUSH_EPSILON) {
+          			applyYaw += pendingYaw;
+          			pendingYaw = 0;
+          		}
+          		if (Math.abs(pendingPitch) < FLUSH_EPSILON) {
+          			applyPitch += pendingPitch;
+          			pendingPitch = 0;
+          		}
+          		outYaw = applyYaw;
+          		outPitch = applyPitch;
+          	}
+
+          	public static void finish(float actualPitchChange) {
+          		if (Math.abs(outPitch) > FLUSH_EPSILON && Math.abs(actualPitchChange) < 1.0e-6f) {
+          			pendingPitch = 0;
+          		}
+          	}
+
+          	// ================= config =================
+
+          	private static void reloadConfigIfChanged(long nowNs) {
+          		if (lastConfigCheckNs != Long.MIN_VALUE && nowNs - lastConfigCheckNs < 1_000_000_000L) {
+          			return;
+          		}
+          		lastConfigCheckNs = nowNs;
+          		try {
+          			if (!Files.exists(CONFIG_PATH)) {
+          				Files.createDirectories(CONFIG_PATH.getParent());
+          				Files.writeString(CONFIG_PATH, GSON.toJson(new Config()));
+          			}
+          			FileTime modified = Files.getLastModifiedTime(CONFIG_PATH);
+          			if (modified.equals(lastModified)) {
+          				return;
+          			}
+          			lastModified = modified;
+          			try (Reader reader = Files.newBufferedReader(CONFIG_PATH)) {
+          				Config loaded = GSON.fromJson(reader, Config.class);
+          				if (loaded != null) {
+          					loaded.lag = Math.max(0, Math.min(100, loaded.lag));
+          					if (loaded.mode == null) loaded.mode = "camera";
+          					config = loaded;
+          					LOGGER.info("Config loaded: enabled={}, mode={}, lag={}", loaded.enabled, loaded.mode, loaded.lag);
+          				}
+          			}
+          		} catch (IOException | RuntimeException e) {
+          			if (!configErrorLogged) {
+          				configErrorLogged = true;
+          				LOGGER.warn("Could not read {} - using current settings", CONFIG_PATH, e);
+          			}
+          		}
+          	}
+          }
+          SMOOTHEOF
+          mkdir -p "$(dirname 'src/main/java/dev/smoothlook/mixin/CameraMixin.java')"
+          cat > 'src/main/java/dev/smoothlook/mixin/CameraMixin.java' <<'SMOOTHEOF'
+          package dev.smoothlook.mixin;
+
+          import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
+          import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
+          import dev.smoothlook.SmoothLook;
+          import net.minecraft.client.Camera;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.injection.At;
+
+          @Mixin(Camera.class)
+          public abstract class CameraMixin {
+
+          	/**
+          	 * The player's real rotation (aim) is untouched and follows the mouse immediately.
+          	 * Only the angles the camera is rendered with lag behind and then catch up.
+          	 */
+          	@WrapOperation(
+          		method = "alignWithEntity",
+          		at = @At(
+          			value = "INVOKE",
+          			target = "Lnet/minecraft/client/Camera;setRotation(FF)V",
+          			ordinal = 0
+          		)
+          	)
+          	private void smoothlook$lagCamera(Camera camera, float yRot, float xRot, Operation<Void> original) {
+          		SmoothLook.applyCamera(yRot, xRot);
+          		original.call(camera, SmoothLook.camYaw, SmoothLook.camPitch);
+          	}
+          }
+          SMOOTHEOF
+          mkdir -p "$(dirname 'src/main/java/dev/smoothlook/mixin/MouseHandlerMixin.java')"
+          cat > 'src/main/java/dev/smoothlook/mixin/MouseHandlerMixin.java' <<'SMOOTHEOF'
+          package dev.smoothlook.mixin;
+
+          import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
+          import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
+          import dev.smoothlook.SmoothLook;
+          import net.minecraft.client.MouseHandler;
+          import net.minecraft.client.player.LocalPlayer;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.injection.At;
+
+          @Mixin(MouseHandler.class)
+          public abstract class MouseHandlerMixin {
+
+          	/**
+          	 * Vanilla turns the player once per frame inside MouseHandler.turnPlayer via LocalPlayer.turn(yaw, pitch).
+          	 * We wrap that single call: the raw mouse delta goes into a buffer, and only a time-based fraction
+          	 * of the buffer is passed on to the original method. The player's REAL rotation therefore is the camera
+          	 * rotation, so the crosshair / hit-scan never diverges from what you see.
+          	 */
+          	@WrapOperation(
+          		method = "turnPlayer",
+          		at = @At(
+          			value = "INVOKE",
+          			target = "Lnet/minecraft/client/player/LocalPlayer;turn(DD)V"
+          		)
+          	)
+          	private void smoothlook$smoothTurn(LocalPlayer player, double yRot, double xRot, Operation<Void> original) {
+          		SmoothLook.prepare(player, yRot, xRot);
+          		float pitchBefore = player.getXRot();
+          		original.call(player, SmoothLook.outYaw, SmoothLook.outPitch);
+          		SmoothLook.finish(player.getXRot() - pitchBefore);
+          	}
+          }
+          SMOOTHEOF
+          mkdir -p "$(dirname 'src/main/resources/fabric.mod.json')"
+          cat > 'src/main/resources/fabric.mod.json' <<'SMOOTHEOF'
+          {
+            "schemaVersion": 1,
+            "id": "smoothlook",
+            "version": "${version}",
+            "name": "Smooth Look",
+            "description": "Camera lags slightly behind mouse movement and smoothly catches up. Client-side only.",
+            "authors": ["You"],
+            "license": "MIT",
+            "environment": "client",
+            "mixins": ["smoothlook.mixins.json"],
+            "depends": {
+              "fabricloader": ">=0.19.5",
+              "minecraft": "~26.3",
+              "java": ">=25"
+            }
+          }
+          SMOOTHEOF
+          mkdir -p "$(dirname 'src/main/resources/smoothlook.mixins.json')"
+          cat > 'src/main/resources/smoothlook.mixins.json' <<'SMOOTHEOF'
+          {
+            "required": true,
+            "minVersion": "0.8",
+            "package": "dev.smoothlook.mixin",
+            "compatibilityLevel": "JAVA_21",
+            "mixins": [],
+            "client": ["MouseHandlerMixin", "CameraMixin"],
+            "injectors": {
+              "defaultRequire": 1
+            }
+          }
+          SMOOTHEOF
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.6.0'
+
+      - name: Build
+        run: gradle build --no-daemon --stacktrace --console=plain
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: smoothlook-jar
+          path: build/libs/smoothlook-1.1.0.jar
+          if-no-files-found: error
